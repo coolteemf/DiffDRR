@@ -65,12 +65,6 @@ class DRR(nn.Module):
 
         # Initialize the volume and world geometry
         self.subject = subject
-        self.volume = subject.volume.data.squeeze()
-        self.register_buffer(
-            "density",
-            subject.density.data.squeeze(),
-            persistent=persistent,
-        )
         self.register_buffer(
             "_affine",
             torch.as_tensor(subject.volume.affine, dtype=torch.float32).unsqueeze(0),
@@ -183,18 +177,21 @@ def forward(
 
 # %% ../notebooks/api/00_drr.ipynb 11
 @patch
-def set_intrinsics(
+def set_intrinsics_(
     self: DRR,
     sdd: float = None,
+    height: int = None,
+    width: int = None,
     delx: float = None,
     dely: float = None,
     x0: float = None,
     y0: float = None,
 ):
+    """Set new intrinsic parameters (inplace)."""
     self.detector = Detector(
         sdd if sdd is not None else self.detector.sdd,
-        self.detector.height,
-        self.detector.width,
+        height if height is not None else self.detector.height,
+        width if width is not None else self.detector.width,
         delx if delx is not None else self.detector.delx,
         dely if dely is not None else self.detector.dely,
         x0 if x0 is not None else self.detector.x0,
@@ -202,9 +199,20 @@ def set_intrinsics(
         n_subsample=self.detector.n_subsample,
         reverse_x_axis=self.detector.reverse_x_axis,
         reorient=self.subject.reorient,
-    ).to(self.volume)
+    ).to(self.density)
 
 # %% ../notebooks/api/00_drr.ipynb 12
+@patch
+def rescale_detector_(self: DRR, scale: float):
+    """Rescale the detector plane (inplace)."""
+    self.set_intrinsics_(
+        height=int(self.detector.height * scale),
+        width=int(self.detector.width * scale),
+        delx=float(self.detector.delx / scale),
+        dely=float(self.detector.dely / scale),
+    )
+
+# %% ../notebooks/api/00_drr.ipynb 13
 @patch
 def perspective_projection(
     self: DRR,
@@ -221,7 +229,7 @@ def perspective_projection(
         x[..., 1] = self.detector.width - x[..., 1]
     return x[..., :2].flip(-1)
 
-# %% ../notebooks/api/00_drr.ipynb 13
+# %% ../notebooks/api/00_drr.ipynb 14
 from torch.nn.functional import pad
 
 
