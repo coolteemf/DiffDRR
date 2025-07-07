@@ -15,13 +15,15 @@ class Siddon(torch.nn.Module):
         self,
         mode: str = "nearest",  # Interpolation mode for grid_sample
         stop_gradients_through_grid_sample: bool = False,  # Apply torch.no_grad when calling grid_sample
-        filter_intersections_outside_volume: bool = True,  # Use alphamin/max to filter the intersections
+        filter_intersections_outside_volume: bool = False,  # Use alphamin/max to filter the intersections
+        reducefn: str = "sum",  # Function for combining samples along each ray
         eps: float = 1e-8,  # Small constant to avoid div by zero errors
     ):
         super().__init__()
         self.mode = mode
         self.stop_gradients_through_grid_sample = stop_gradients_through_grid_sample
         self.filter_intersections_outside_volume = filter_intersections_outside_volume
+        self.reducefn = reducefn
         self.eps = eps
 
     def dims(self, volume):
@@ -32,6 +34,7 @@ class Siddon(torch.nn.Module):
         volume,
         source,
         target,
+        img,
         align_corners=False,
         mask=None,
     ):
@@ -48,7 +51,7 @@ class Siddon(torch.nn.Module):
 
         # Calculate the midpoint of every pair of adjacent intersections
         # These midpoints lie exclusively in a single voxel
-        alphamid = (alphas[..., 0:-1] + alphas[..., 1:]) / 2
+        alphamid = (alphas[..., :-1] + alphas[..., 1:]) / 2
 
         # Get the XYZ coordinate of each midpoint (normalized to [-1, +1]^3)
         xyzs = _get_xyzs(alphamid, source, target, dims, self.eps)
@@ -56,9 +59,11 @@ class Siddon(torch.nn.Module):
         # Use torch.nn.functional.grid_sample to lookup the values of each intersected voxel
         if self.stop_gradients_through_grid_sample:
             with torch.no_grad():
-                img = _get_voxel(volume, xyzs, self.mode, align_corners=align_corners)
+                img = _get_voxel(
+                    volume, xyzs, img, self.mode, align_corners=align_corners
+                )
         else:
-            img = _get_voxel(volume, xyzs, self.mode, align_corners=align_corners)
+            img = _get_voxel(volume, xyzs, img, self.mode, align_corners=align_corners)
 
         # Weight each intersected voxel by the length of the ray's intersection with the voxel
         intersection_length = torch.diff(alphas, dim=-1)
@@ -66,7 +71,7 @@ class Siddon(torch.nn.Module):
 
         # Handle optional masking
         if mask is None:
-            img = img.sum(dim=-1)
+            img = reduce(img, self.reducefn)
             img = img.unsqueeze(1)
         else:
             # Thanks to @Ivan for the clutch assist w/ pytorch tensor ops
@@ -74,7 +79,7 @@ class Siddon(torch.nn.Module):
             B, D, _ = img.shape
             C = int(mask.max().item() + 1)
             channels = _get_voxel(
-                mask, xyzs, self.mode, align_corners=align_corners
+                mask, xyzs, img=None, mode=self.mode, align_corners=align_corners
             ).long()
             img = (
                 torch.zeros(B, C, D)
@@ -82,18 +87,15 @@ class Siddon(torch.nn.Module):
                 .scatter_add_(1, channels.transpose(-1, -2), img.transpose(-1, -2))
             )
 
-        # Multiply by ray length such that the proportion of attenuated energy is unitless
-        raylength = (target - source + self.eps).norm(dim=-1)
-        img *= raylength.unsqueeze(1)
         return img
 
 # %% ../notebooks/api/01_renderers.ipynb 8
 def _get_alphas(source, target, dims, eps, filter_intersections_outside_volume):
     """Calculates the parametric intersections of each ray with the planes of the CT volume."""
     # Parameterize the parallel XYZ planes that comprise the CT volumes
-    alphax = torch.arange(dims[0] + 1).to(source)
-    alphay = torch.arange(dims[1] + 1).to(source)
-    alphaz = torch.arange(dims[2] + 1).to(source)
+    alphax = torch.arange(dims[0] + 1).to(source) - 0.5
+    alphay = torch.arange(dims[1] + 1).to(source) - 0.5
+    alphaz = torch.arange(dims[2] + 1).to(source) - 0.5
 
     # Calculate the parametric intersection of each ray with every plane
     sx, sy, sz = source[..., 0:1], source[..., 1:2], source[..., 2:3]
@@ -122,8 +124,11 @@ def _get_alpha_minmax(source, target, dims, eps):
     """Calculate the first and last intersections of each ray with the volume."""
     sdd = target - source + eps
 
-    alpha0 = (torch.zeros(3).to(source) - source) / sdd
-    alpha1 = ((dims + 1).to(source) - source) / sdd
+    min_plane = torch.zeros(3).to(source) - 0.5
+    max_plane = dims.to(source) - 0.5
+
+    alpha0 = (min_plane - source) / sdd
+    alpha1 = (max_plane - source) / sdd
     alphas = torch.stack([alpha0, alpha1])
 
     alphamin = alphas.min(dim=0).values.max(dim=-1).values.unsqueeze(-1)
@@ -143,11 +148,11 @@ def _get_xyzs(alpha, source, target, dims, eps):
     ).unsqueeze(1)
 
     # Normalize coordinates to be in [-1, +1] for grid_sample
-    xyzs = 2 * xyzs / dims - 1
+    xyzs = 2 * (xyzs + 0.5) / dims - 1
     return xyzs
 
 
-def _get_voxel(volume, xyzs, mode, align_corners):
+def _get_voxel(volume, xyzs, img, mode, align_corners):
     """Wraps torch.nn.functional.grid_sample to sample a volume at XYZ coordinates."""
     batch_size = len(xyzs)
     voxels = grid_sample(
@@ -156,19 +161,39 @@ def _get_voxel(volume, xyzs, mode, align_corners):
         mode=mode,
         align_corners=align_corners,
     )[:, 0, 0]
-    return voxels
+    if img is not None:
+        img = torch.einsum("bcn, bnj -> bnj", img, voxels)
+    else:
+        img = voxels
+    return img
 
-# %% ../notebooks/api/01_renderers.ipynb 10
+# %% ../notebooks/api/01_renderers.ipynb 9
+from typing import Callable
+
+
+def reduce(img, reducefn):
+    if reducefn == "sum":
+        return img.sum(dim=-1)
+    elif reducefn == "max":
+        return img.max(dim=-1).values
+    elif isinstance(reducefn, Callable):
+        return reducefn(img)
+    else:
+        raise ValueError(f"Only supports reducefn 'sum' or 'max', not {reducefn}")
+
+# %% ../notebooks/api/01_renderers.ipynb 11
 class Trilinear(torch.nn.Module):
     """Differentiable X-ray renderer implemented with trilinear interpolation."""
 
     def __init__(
         self,
         mode: str = "bilinear",  # Interpolation mode for grid_sample
+        reducefn: str = "sum",  # Function for combining samples along each ray
         eps: float = 1e-8,  # Small constant to avoid div by zero errors
     ):
         super().__init__()
         self.mode = mode
+        self.reducefn = reducefn
         self.eps = eps
 
     def dims(self, volume):
@@ -179,6 +204,7 @@ class Trilinear(torch.nn.Module):
         volume,
         source,
         target,
+        img,
         n_points=500,
         align_corners=False,
         mask=None,
@@ -200,16 +226,21 @@ class Trilinear(torch.nn.Module):
         xyzs = _get_xyzs(alphas, source, target, dims, self.eps)
 
         # Sample the volume with trilinear interpolation
-        img = _get_voxel(volume, xyzs, self.mode, align_corners=align_corners)
+        img = _get_voxel(volume, xyzs, img, self.mode, align_corners=align_corners)
+
+        # Multiply by the step size to compute the rectangular rule for integration
+        step_size = (alphamax - alphamin) / (n_points - 1)
+        img = img * step_size
 
         # Handle optional masking
         if mask is None:
-            img = img.sum(dim=-1).unsqueeze(1)
+            img = reduce(img, self.reducefn)
+            img = img.unsqueeze(1)
         else:
             B, D, _ = img.shape
             C = int(mask.max().item() + 1)
             channels = _get_voxel(
-                mask, xyzs, self.mode, align_corners=align_corners
+                mask, xyzs, img=None, mode="nearest", align_corners=align_corners
             ).long()
             img = (
                 torch.zeros(B, C, D)
@@ -217,7 +248,4 @@ class Trilinear(torch.nn.Module):
                 .scatter_add_(1, channels.transpose(-1, -2), img.transpose(-1, -2))
             )
 
-        # Multiply by raylength and return the drr
-        raylength = (target - source + self.eps).norm(dim=-1).unsqueeze(1)
-        img *= raylength / n_points
         return img

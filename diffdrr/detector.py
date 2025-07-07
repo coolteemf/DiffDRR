@@ -8,11 +8,10 @@ from fastcore.basics import patch
 from torch.nn.functional import normalize
 
 # %% auto 0
-__all__ = ['Detector']
+__all__ = ['Detector', 'get_focal_length', 'get_principal_point', 'parse_intrinsic_matrix', 'make_intrinsic_matrix']
 
 # %% ../notebooks/api/02_detector.ipynb 5
 from .pose import RigidTransform
-from .utils import make_intrinsic_matrix
 
 
 class Detector(torch.nn.Module):
@@ -20,14 +19,14 @@ class Detector(torch.nn.Module):
 
     def __init__(
         self,
-        sdd: float,  # Source-to-detector distance (i.e., focal length)
-        height: int,  # Height of the X-ray detector
-        width: int,  # Width of the X-ray detector
-        delx: float,  # Pixel spacing in the X-direction
-        dely: float,  # Pixel spacing in the Y-direction
-        x0: float,  # Principal point X-offset
-        y0: float,  # Principal point Y-offset
-        reorient: torch.tensor,  # Frame-of-reference change matrix
+        sdd: float,  # Source-to-detector distance (in units length)
+        height: int,  # Y-direction length (in units pixels)
+        width: int,  # X-direction length (in units pixels)
+        delx: float,  # X-direction spacing (in units length / pixel)
+        dely: float,  # Y-direction spacing (in units length / pixel)
+        x0: float,  # Principal point x-coordinate (in units length)
+        y0: float,  # Principal point y-coordinate (in units length)
+        reorient: torch.Tensor,  # Frame-of-reference change matrix
         n_subsample: int | None = None,  # Number of target points to randomly sample
         reverse_x_axis: bool = False,  # If pose includes reflection (in E(3) not SE(3)), reverse x-axis
     ):
@@ -52,8 +51,8 @@ class Detector(torch.nn.Module):
             "_calibration",
             torch.tensor(
                 [
-                    [dely, 0, 0, -y0],
-                    [0, delx, 0, x0],
+                    [delx, 0, 0, x0],
+                    [0, dely, 0, y0],
                     [0, 0, sdd, 0],
                     [0, 0, 0, 1],
                 ]
@@ -66,19 +65,19 @@ class Detector(torch.nn.Module):
 
     @property
     def delx(self):
-        return self._calibration[1, 1].item()
-
-    @property
-    def dely(self):
         return self._calibration[0, 0].item()
 
     @property
+    def dely(self):
+        return self._calibration[1, 1].item()
+
+    @property
     def x0(self):
-        return -self._calibration[1, -1].item()
+        return -self._calibration[0, -1].item()
 
     @property
     def y0(self):
-        return -self._calibration[0, -1].item()
+        return -self._calibration[1, -1].item()
 
     @property
     def reorient(self):
@@ -92,15 +91,7 @@ class Detector(torch.nn.Module):
     @property
     def intrinsic(self):
         """The 3x3 intrinsic matrix."""
-        return make_intrinsic_matrix(
-            self.sdd,
-            self.delx,
-            self.dely,
-            self.width,
-            self.height,
-            self.y0,
-            self.x0,
-        ).to(self.source)
+        return make_intrinsic_matrix(self).to(self.source)
 
 # %% ../notebooks/api/02_detector.ipynb 6
 @patch
@@ -116,7 +107,7 @@ def _initialize_carm(self: Detector):
     center = torch.tensor([[0.0, 0.0, 1.0]], device=device)
 
     # Use the standard basis for the detector plane
-    basis = torch.tensor([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], device=device)
+    basis = torch.tensor([[0.0, 1.0, 0.0], [1.0, 0.0, 0.0]], device=device)
 
     # Construct the detector plane with different offsets for even or odd heights
     # These ensure that the detector plane is centered around (0, 0, 1)
@@ -126,8 +117,12 @@ def _initialize_carm(self: Detector):
     # Construct equally spaced points along the basis vectors
     t = torch.arange(-self.height // 2, self.height // 2, device=device) + h_off
     s = torch.arange(-self.width // 2, self.width // 2, device=device) + w_off
-    if self.reverse_x_axis:
+
+    t = -t
+    s = -s
+    if not self.reverse_x_axis:
         s = -s
+
     coefs = torch.cartesian_prod(t, s).reshape(-1, 2)
     target = torch.einsum("cd,nc->nd", basis, coefs)
     target += center
@@ -157,3 +152,51 @@ def forward(self: Detector, extrinsic: RigidTransform, calibration: RigidTransfo
     source = pose(self.source)
     target = pose(target)
     return source, target
+
+# %% ../notebooks/api/02_detector.ipynb 9
+def get_focal_length(
+    intrinsic,  # Intrinsic matrix (3 x 3 tensor)
+    delx: float,  # X-direction spacing (in units length)
+    dely: float,  # Y-direction spacing (in units length)
+) -> float:  # Focal length (in units length)
+    fx = intrinsic[0, 0]
+    fy = intrinsic[1, 1]
+    return abs((fx * delx) + (fy * dely)).item() / 2.0
+
+# %% ../notebooks/api/02_detector.ipynb 10
+def get_principal_point(
+    intrinsic,  # Intrinsic matrix (3 x 3 tensor)
+    height: int,  # Y-direction length (in units pixels)
+    width: int,  # X-direction length (in units pixels)
+    delx: float,  # X-direction spacing (in units length)
+    dely: float,  # Y-direction spacing (in units length)
+):
+    x0 = delx * (intrinsic[0, 2] - width / 2)
+    y0 = dely * (intrinsic[1, 2] - height / 2)
+    return x0.item(), y0.item()
+
+# %% ../notebooks/api/02_detector.ipynb 11
+def parse_intrinsic_matrix(
+    intrinsic,  # Intrinsic matrix (3 x 3 tensor)
+    height: int,  # Y-direction length (in units pixels)
+    width: int,  # X-direction length (in units pixels)
+    delx: float,  # X-direction spacing (in units length)
+    dely: float,  # Y-direction spacing (in units length)
+):
+    focal_length = get_focal_length(intrinsic, delx, dely)
+    x0, y0 = get_principal_point(intrinsic, height, width, delx, dely)
+    return focal_length, x0, y0
+
+# %% ../notebooks/api/02_detector.ipynb 12
+def make_intrinsic_matrix(detector: Detector):
+    fx = detector.sdd / detector.delx
+    fy = detector.sdd / detector.dely
+    u0 = detector.x0 / detector.delx + detector.width / 2
+    v0 = detector.y0 / detector.dely + detector.height / 2
+    return torch.tensor(
+        [
+            [fx, 0.0, u0],
+            [0.0, fy, v0],
+            [0.0, 0.0, 1.0],
+        ]
+    )

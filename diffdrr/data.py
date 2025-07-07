@@ -8,6 +8,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import torch
+from nibabel.orientations import apply_orientation, axcodes2ornt, ornt_transform
 from torchio import LabelMap, ScalarImage, Subject
 from torchio.transforms import Resample
 
@@ -37,6 +38,9 @@ def load_example_ct(
     )
 
 # %% ../notebooks/api/03_data.ipynb 6
+from .pose import RigidTransform
+
+
 def read(
     volume: str | Path | ScalarImage,  # CT volume
     labelmap: str | Path | LabelMap = None,  # Labelmap for the CT volume
@@ -44,6 +48,9 @@ def read(
     orientation: str | None = "AP",  # Frame-of-reference change
     bone_attenuation_multiplier: float = 1.0,  # Scalar multiplier on density of high attenuation voxels
     fiducials: torch.Tensor = None,  # 3D fiducials in world coordinates
+    transform: RigidTransform = None,  # RigidTransform to apply to the volume's affine
+    center_volume: bool = True,  # Move the volume's isocenter to the world origin
+    resample_target=None,  # Resampling resolution argument passed to torchio.transforms.Resample
     **kwargs,  # Any additional information to be stored in the torchio.Subject
 ) -> Subject:
     """
@@ -57,10 +64,6 @@ def read(
     else:
         volume = ScalarImage(volume)
 
-    # Convert the volume to density
-    density = transform_hu_to_density(volume.data, bone_attenuation_multiplier)
-    density = ScalarImage(tensor=density, affine=volume.affine)
-
     # Read the mask if passed
     if labelmap is not None:
         if isinstance(labelmap, LabelMap):
@@ -71,38 +74,49 @@ def read(
     else:
         mask = None
 
+    # Optionally apply transform
+    if transform is not None:
+        T = transform.matrix[0].numpy()
+        volume = ScalarImage(tensor=volume.data, affine=T.dot(volume.affine))
+
+    # Convert the volume to density
+    density = transform_hu_to_density(volume.data, bone_attenuation_multiplier)
+    density = ScalarImage(tensor=density, affine=volume.affine)
+
     # Frame-of-reference change
     if orientation == "AP":
         # Rotates the C-arm about the x-axis by 90 degrees
-        # Rotates the C-arm about the z-axis by -90 degrees
         reorient = torch.tensor(
             [
-                [0.0, 1.0, 0.0, 0.0],
-                [0.0, 0.0, -1.0, 0.0],
-                [-1.0, 0.0, 0.0, 0.0],
-                [0.0, 0.0, 0.0, 1.0],
-            ]
+                [1, 0, 0, 0],
+                [0, 0, -1, 0],
+                [0, 1, 0, 0],
+                [0, 0, 0, 1],
+            ],
+            dtype=torch.float32,
         )
     elif orientation == "PA":
         # Rotates the C-arm about the x-axis by 90 degrees
-        # Rotates the C-arm about the z-axis by 90 degrees
+        # Reverses the direction of the y-axis
         reorient = torch.tensor(
             [
-                [0.0, 1.0, 0.0, 0.0],
-                [0.0, 0.0, 1.0, 0.0],
-                [-1.0, 0.0, 0.0, 0.0],
-                [0.0, 0.0, 0.0, 1.0],
-            ]
+                [1, 0, 0, 0],
+                [0, 0, 1, 0],
+                [0, 1, 0, 0],
+                [0, 0, 0, 1],
+            ],
+            dtype=torch.float32,
         )
     elif orientation is None:
         # Identity transform
         reorient = torch.tensor(
             [
-                [1.0, 0.0, 0.0, 0.0],
-                [0.0, 1.0, 0.0, 0.0],
-                [0.0, 0.0, 1.0, 0.0],
-                [0.0, 0.0, 0.0, 1.0],
-            ]
+                [1, 0, 0, 0],
+                [0, 1, 0, 0],
+                [0, 0, 1, 0],
+                [0, 0, 0, 1],
+            ],
+            dtype=torch.float32,
         )
     else:
         raise ValueError(f"Unrecognized orientation {orientation}")
@@ -111,24 +125,58 @@ def read(
     subject = Subject(
         volume=volume,
         mask=mask,
+        orientation=orientation,
         reorient=reorient,
         density=density,
         fiducials=fiducials,
         **kwargs,
     )
 
-    # Canonicalize the images by converting to RAS+ and moving the
-    # Subject's isocenter to the origin in world coordinates
-    subject = canonicalize(subject)
+    # Move the subject's isocenter to the origin in world coordinates
+    if center_volume:
+        subject = canonicalize(subject)
 
     # Apply mask
     if labels is not None:
         if isinstance(labels, int):
             labels = [labels]
-        mask = torch.any(
-            torch.stack([subject.mask.data.squeeze() == idx for idx in labels]), dim=0
-        )
-        subject.density.data = subject.density.data * mask
+        if subject.volume.orientation == subject.mask.orientation:
+            mask = torch.any(
+                torch.stack([subject.mask.data.squeeze() == idx for idx in labels]),
+                dim=0,
+            )
+        else:
+            # If the mask does not have the same orientation, transform the mask data
+            # to match the orientation of the volume data
+            transform = ornt_transform(
+                axcodes2ornt(subject.mask.orientation),
+                axcodes2ornt(subject.volume.orientation),
+            )
+            mask = torch.any(
+                torch.stack(
+                    [
+                        torch.tensor(
+                            apply_orientation(subject.mask.data.squeeze(), transform)
+                            == idx
+                        )
+                        for idx in labels
+                    ]
+                ),
+                dim=0,
+            )
+
+        # Mask all volumes, unless error, then just mask the density
+        try:
+            subject.volume.data = subject.volume.data * mask
+            subject.mask.data = subject.mask.data * mask
+            subject.density.data = subject.density.data * mask
+        except:
+            subject.density.data = subject.density.data * mask
+
+    # Apply resample
+    if resample_target is not None:
+        resample = Resample(resample_target)
+        subject = resample(subject)
 
     return subject
 

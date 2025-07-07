@@ -98,14 +98,15 @@ class DRR(nn.Module):
             )
         self.reshape = reshape
         self.patch_size = patch_size
-        if self.patch_size is not None:
-            self.n_patches = (height * width) // (self.patch_size**2)
 
     def reshape_transform(self, img, batch_size):
         if self.reshape:
             if self.detector.n_subsample is None:
                 img = img.view(
-                    batch_size, -1, self.detector.height, self.detector.width
+                    batch_size,
+                    -1,
+                    self.detector.height,
+                    self.detector.width,
                 )
             else:
                 img = reshape_subsampled_drr(img, self.detector, batch_size)
@@ -118,6 +119,18 @@ class DRR(nn.Module):
     @property
     def affine_inverse(self):
         return RigidTransform(self._affine_inverse)
+
+    @property
+    def n_patches(self):
+        return (self.detector.height * self.detector.width) // (self.patch_size**2)
+
+    @property
+    def device(self):
+        return self.density.device
+
+    @property
+    def dtype(self):
+        return self.density.dtype
 
 # %% ../notebooks/api/00_drr.ipynb 8
 def reshape_subsampled_drr(img: torch.Tensor, detector: Detector, batch_size: int):
@@ -147,33 +160,50 @@ def forward(
         pose = args[0]
     else:
         pose = convert(*args, parameterization=parameterization, convention=convention)
+
+    # Create the source / target points and render the image
     source, target = self.detector(pose, calibration)
+    img = self.render(self.density, source, target, mask_to_channels, **kwargs)
+    return self.reshape_transform(img, batch_size=len(pose))
+
+
+@patch
+def render(
+    self: DRR,
+    density: torch.tensor,  # Volume from which to render DRRs
+    source: torch.tensor,  # World coordinates of X-ray source
+    target: torch.tensor,  # World coordinates of X-ray target
+    mask_to_channels: bool = False,  # If True, structures from the CT mask are rendered in separate channels
+    **kwargs,
+):
+    # Initialize the image with the length of each cast ray
+    img = (target - source).norm(dim=-1).unsqueeze(1)
+
+    # Convert rays to voxelspace
     source = self.affine_inverse(source)
     target = self.affine_inverse(target)
 
-    # Render the DRR
+    # Render the image
     kwargs["mask"] = self.mask if mask_to_channels else None
     if self.patch_size is None:
         img = self.renderer(
-            self.density,
+            density,
             source,
             target,
+            img,
             **kwargs,
         )
     else:
-        n_points = target.shape[1] // self.n_patches
-        img = []
-        for idx in range(self.n_patches):
-            t = target[:, idx * n_points : (idx + 1) * n_points]
-            partial = self.renderer(
-                self.density,
-                source,
-                t,
-                **kwargs,
-            )
-            img.append(partial)
-        img = torch.cat(img, dim=-1)
-    return self.reshape_transform(img, batch_size=len(pose))
+        partials = []
+        for t, i in zip(
+            target.chunk(self.n_patches, dim=1),
+            img.chunk(self.n_patches, dim=-1),
+        ):
+            partial = self.renderer(density, source, t, i, **kwargs)
+            partials.append(partial)
+        img = torch.cat(partials, dim=-1)
+
+    return img
 
 # %% ../notebooks/api/00_drr.ipynb 11
 @patch
@@ -186,6 +216,8 @@ def set_intrinsics_(
     dely: float = None,
     x0: float = None,
     y0: float = None,
+    n_subsample: int = None,
+    reverse_x_axis: bool = None,
 ):
     """Set new intrinsic parameters (inplace)."""
     self.detector = Detector(
@@ -194,11 +226,11 @@ def set_intrinsics_(
         width if width is not None else self.detector.width,
         delx if delx is not None else self.detector.delx,
         dely if dely is not None else self.detector.dely,
-        x0 if x0 is not None else self.detector.x0,
-        y0 if y0 is not None else self.detector.y0,
-        n_subsample=self.detector.n_subsample,
-        reverse_x_axis=self.detector.reverse_x_axis,
-        reorient=self.subject.reorient,
+        x0 if x0 is not None else -self.detector.x0,
+        y0 if y0 is not None else -self.detector.y0,
+        self.subject.reorient,
+        n_subsample if n_subsample is not None else self.detector.n_subsample,
+        reverse_x_axis if reverse_x_axis is not None else self.detector.reverse_x_axis,
     ).to(self.density)
 
 # %% ../notebooks/api/00_drr.ipynb 12
@@ -220,14 +252,21 @@ def perspective_projection(
     pts: torch.Tensor,
 ):
     """Project points in world coordinates (3D) onto the pixel plane (2D)."""
+    # Poses in DiffDRR are world2camera, but perspective transforms use camera2world, so invert
     extrinsic = (self.detector.reorient.compose(pose)).inverse()
     x = extrinsic(pts)
+
+    # Project onto the detector plane
     x = torch.einsum("ij, bnj -> bni", self.detector.intrinsic, x)
     z = x[..., -1].unsqueeze(-1).clone()
     x = x / z
+
+    # Move origin to upper-left corner
+    x[..., 1] = self.detector.height - x[..., 1]
     if self.detector.reverse_x_axis:
-        x[..., 1] = self.detector.width - x[..., 1]
-    return x[..., :2].flip(-1)
+        x[..., 0] = self.detector.width - x[..., 0]
+
+    return x[..., :2]
 
 # %% ../notebooks/api/00_drr.ipynb 14
 from torch.nn.functional import pad
@@ -240,9 +279,9 @@ def inverse_projection(
     pts: torch.Tensor,
 ):
     """Backproject points in pixel plane (2D) onto the image plane in world coordinates (3D)."""
-    pts = pts.flip(-1)
+    pts[..., 1] = self.detector.height - pts[..., 1]
     if self.detector.reverse_x_axis:
-        pts[..., 1] = self.detector.width - pts[..., 1]
+        pts[..., 0] = self.detector.width - pts[..., 0]
     x = self.detector.sdd * torch.einsum(
         "ij, bnj -> bni",
         self.detector.intrinsic.inverse(),
